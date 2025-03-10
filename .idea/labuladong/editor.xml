@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="LeetcodeEditorlabuladong">
+    <option name="projectConfig">
+      <map>
+        <entry key="$PROJECT_DIR$/../LeetCode/leetcode/editor/cn/[2269]找到一个数字的 K 美丽值.cpp">
+          <value>
+            <LeetcodeEditor>
+              <option name="contentPath" value="$PROJECT_DIR$/../LeetCode/leetcode/editor/cn/doc/content/[2269]找到一个数字的 K 美丽值.md" />
+              <option name="frontendQuestionId" value="leetcode.cn2269" />
+              <option name="host" value="leetcode.cn" />
+              <option name="path" value="$PROJECT_DIR$/../LeetCode/leetcode/editor/cn/[2269]找到一个数字的 K 美丽值.cpp" />
+              <option name="titleSlug" value="find-the-k-beauty-of-a-number" />
+            </LeetcodeEditor>
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+</project>
