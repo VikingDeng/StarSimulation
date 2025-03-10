@@ -2,7 +2,6 @@
 // Created by viking on 2025/3/9.
 //
 
-
 #include "dataset.h"
 #include <glob.h>
 #include <cstring>
@@ -10,6 +9,11 @@
 #include <stdexcept>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
+#include <chrono>
+#include <iomanip>
+#include <sys/stat.h>
+#include <atomic>
 
 namespace {
     // 字段定义 (字节位置从0开始计算)
@@ -21,19 +25,17 @@ namespace {
     };
 
     const std::vector<std::pair<std::string, FieldSpec>> FIELD_DEFS = {
-        // 核心定位与运动参数
-        {"TYC1",    {0,   4, FieldSpec::INT,    1}},      // TYC标识符（可选，用于唯一标识）
-        {"mRAdeg",  {15, 12, FieldSpec::DOUBLE, 1}},      // 平均赤经（ICRS J2000.0，单位：度）
-        {"mDEdeg",  {28, 12, FieldSpec::DOUBLE, 1}},      // 平均赤纬（ICRS J2000.0，单位：度）
-        {"pmRA",    {41,  7, FieldSpec::DOUBLE, 0.001}},  // 赤经自行（单位：角秒/年，原始数据为毫角秒/年）
-        {"pmDE",    {49,  7, FieldSpec::DOUBLE, 0.001}},  // 赤纬自行（单位：角秒/年）
-        {"mepRA",   {76,  7, FieldSpec::DOUBLE, 1}},      // 赤经平均历元（单位：年）
-        {"mepDE",   {83,  7, FieldSpec::DOUBLE, 1}},      // 赤纬平均历元（单位：年）
-
-        // 星等参数（必要）
-        {"BT",      {111, 6, FieldSpec::DOUBLE, 1}},      // Tycho-2 B_T星等（单位：星等）
-        {"VT",      {124, 6, FieldSpec::DOUBLE, 1}},      // Tycho-2 V_T星等（单位：星等）
-
+        {"TYC1",    {0,   4, FieldSpec::INT,    1}},
+        {"TYC2",    {5,   5, FieldSpec::INT,    1}},     // 修正长度
+        {"TYC3",    {11,  2, FieldSpec::INT,    1}},     // 修正位置
+        {"mRAdeg",  {15, 13, FieldSpec::DOUBLE, 1}},
+        {"mDEdeg",  {28, 13, FieldSpec::DOUBLE, 1}},
+        {"pmRA",    {41,  8, FieldSpec::DOUBLE, 0.001}},
+        {"pmDE",    {49,  8, FieldSpec::DOUBLE, 0.001}},
+        {"mepRA",   {75,  8, FieldSpec::DOUBLE, 1}},
+        {"mepDE",   {83,  8, FieldSpec::DOUBLE, 1}},
+        {"BT",      {110, 7, FieldSpec::DOUBLE, 1}},
+        {"VT",      {123, 7, FieldSpec::DOUBLE, 1}},
     };
 
     std::vector<std::string> Glob(const std::string& pattern) {
@@ -52,6 +54,97 @@ namespace {
         globfree(&glob_result);
         return files;
     }
+
+    void trim(std::string& s) {
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch) {
+            return !std::isspace(ch);
+        }));
+        s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) {
+            return !std::isspace(ch);
+        }).base(), s.end());
+    }
+
+    // 进度条相关变量
+    std::atomic<size_t> total_lines_processed(0); // 已处理的总行数
+    std::atomic<size_t> total_lines_to_process(0); // 需要处理的总行数
+    std::mutex progress_mutex;
+
+    // 进度条更新函数
+    void UpdateProgress() {
+        static auto start_time = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
+        size_t processed = total_lines_processed.load();
+        size_t total = total_lines_to_process.load();
+
+        if (total == 0) return;
+
+        double progress = static_cast<double>(processed) / total;
+        int bar_width = 50;
+
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        std::cout << "[" << std::string(static_cast<int>(bar_width * progress), '#')
+                  << std::string(bar_width - static_cast<int>(bar_width * progress), ' ')
+                  << "] " << std::setprecision(2) << std::fixed << progress * 100 << "% ("
+                  << processed << "/" << total << ") - "
+                  << "Elapsed: " << elapsed << "s - "
+                  << "ETA: " << static_cast<int>(elapsed / progress - elapsed) << "s\r";
+        std::cout.flush();
+    }
+
+    // 统计文件总行数
+    size_t CountLines(const std::string& file_path) {
+        std::ifstream fin(file_path);
+        if (!fin) return 0;
+
+        size_t count = 0;
+        std::string line;
+        while (std::getline(fin, line)) {
+            count++;
+        }
+        return count;
+    }
+
+    // 统计所有文件总行数
+    void CountTotalLines(const std::vector<std::string>& files) {
+        size_t total = 0;
+        for (const auto& file : files) {
+            total += CountLines(file);
+        }
+        total_lines_to_process.store(total);
+    }
+
+    // 记录数据库当前状态
+    void LogDatabaseStatus(redisContext* c, const std::string& log_file) {
+        std::ofstream fout(log_file, std::ios::app);
+        if (!fout) {
+            std::cerr << "Failed to open log file: " << log_file << std::endl;
+            return;
+        }
+
+        fout << "Database status before insertion:" << std::endl;
+
+        // 获取数据库信息
+        if (redisAppendCommand(c, "INFO") != REDIS_OK) {
+            std::cerr << "Redis append error: " << c->errstr << std::endl;
+            return;
+        }
+
+        redisReply* reply;
+        if (redisGetReply(c, (void**)&reply) != REDIS_OK) {
+            std::cerr << "Redis error: " << c->errstr << std::endl;
+            freeReplyObject(reply);
+            return;
+        }
+
+        if (reply->type == REDIS_REPLY_STRING) {
+            fout << reply->str << std::endl;
+        } else {
+            fout << "Failed to get database info" << std::endl;
+        }
+
+        freeReplyObject(reply);
+        fout << "----------------------------------------" << std::endl;
+    }
 }
 
 void Tycho2Dataset::ProcessDirectory(const std::string& data_dir) {
@@ -59,35 +152,65 @@ void Tycho2Dataset::ProcessDirectory(const std::string& data_dir) {
 
     try {
         std::vector<std::thread> workers;
+        auto files = Glob(pattern);
 
-        for(auto files = Glob(pattern); const auto& file: files) {
+        // 连接到 Redis
+        redisContext* c = redisConnect(redis_host_.c_str(), redis_port_);
+        if (c == nullptr || c->err) {
+            std::lock_guard<std::mutex> lock(io_mutex_);
+            std::cerr << "Redis connection error: "
+                      << (c ? c->errstr : "can't allocate context")
+                      << std::endl;
+            return;
+        }
+
+        // 记录数据库当前状态
+        LogDatabaseStatus(c, "database_status.log");
+
+        // 统计总行数
+        CountTotalLines(files);
+
+        // 启动进度条更新线程
+        std::thread progress_thread([]() {
+            while (total_lines_processed.load() < total_lines_to_process.load()) {
+                UpdateProgress();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            UpdateProgress(); // 最后一次更新
+            std::cout << std::endl;
+        });
+
+        for (const auto& file : files) {
             workers.emplace_back([this, file] {
                 ProcessFile(file);
             });
         }
 
-        for(auto& t : workers) {
+        for (auto& t : workers) {
             t.join();
         }
-    } catch(const std::exception& e) {
-        std::lock_guard <std::mutex> lock(io_mutex_);
+
+        progress_thread.join();
+        redisFree(c);
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(io_mutex_);
         std::cerr << "Error: " << e.what() << std::endl;
     }
 }
 
 void Tycho2Dataset::ProcessFile(const std::string& file_path) {
     redisContext* c = redisConnect(redis_host_.c_str(), redis_port_);
-    if(c == nullptr || c->err) {
-        std::lock_guard <std::mutex> lock(io_mutex_);
+    if (c == nullptr || c->err) {
+        std::lock_guard<std::mutex> lock(io_mutex_);
         std::cerr << "Redis connection error: "
-                 << (c ? c->errstr : "can't allocate context")
-                 << std::endl;
+                  << (c ? c->errstr : "can't allocate context")
+                  << std::endl;
         return;
     }
 
     std::ifstream fin(file_path);
-    if(!fin) {
-        std::lock_guard <std::mutex> lock(io_mutex_);
+    if (!fin) {
+        std::lock_guard<std::mutex> lock(io_mutex_);
         std::cerr << "Failed to open: " << file_path << std::endl;
         redisFree(c);
         return;
@@ -97,35 +220,37 @@ void Tycho2Dataset::ProcessFile(const std::string& file_path) {
     redis_cmds.reserve(batch_size_);
     std::string line;
 
-    while(std::getline(fin, line)) {
+    while (std::getline(fin, line)) {
         try {
             Tycho2Entry entry = ParseLine(line);
 
             std::string cmd =
-                "HSET tyc:" + entry.TYC_ID +
-                " TYC1 " + std::to_string(entry.TYC1) +
-                " TYC2 " + std::to_string(entry.TYC2) +
-                " TYC3 " + std::to_string(entry.TYC3) +
-                " pflag " + std::string(1, entry.pflag) +
-                " RAmdeg " + std::to_string(entry.RAmdeg) +
-                " DEpmdeg " + std::to_string(entry.DEpmdeg) +
+                "HSET " + entry.TYC_ID +
+                " mRAdeg " + std::to_string(entry.mRAdeg) +
+                " mDEdeg " + std::to_string(entry.mDEdeg) +
                 " pmRA " + std::to_string(entry.pmRA) +
-                " pmDE " + std::to_string(entry.pmDE);
+                " pmDE " + std::to_string(entry.pmDE) +
+                " mepRA " + std::to_string(entry.mepRA) +
+                " mepDE " + std::to_string(entry.mepDE) +
+                " V_mag " + std::to_string(entry.V_mag);
 
             redis_cmds.push_back(cmd);
 
-            if(redis_cmds.size() >= batch_size_) {
+            if (redis_cmds.size() >= batch_size_) {
                 FlushRedisBatch(c, redis_cmds);
             }
-        } catch(const std::exception& e) {
-            std::lock_guard <std::mutex> lock(io_mutex_);
+
+            // 更新已处理行数
+            total_lines_processed.fetch_add(1, std::memory_order_relaxed);
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lock(io_mutex_);
             std::cerr << "Parse error: " << e.what()
-                     << "\nLine: " << line << std::endl;
+                      << "\nLine: " << line << std::endl;
         }
     }
 
     // 刷新剩余数据
-    if(!redis_cmds.empty()) {
+    if (!redis_cmds.empty()) {
         FlushRedisBatch(c, redis_cmds);
     }
 
@@ -135,40 +260,45 @@ void Tycho2Dataset::ProcessFile(const std::string& file_path) {
 Tycho2Entry Tycho2Dataset::ParseLine(const std::string& line) {
     Tycho2Entry entry;
 
-    for(const auto& [name, spec] : FIELD_DEFS) {
-        if(spec.start + spec.length > line.length()) {
+    for (const auto& [name, spec] : FIELD_DEFS) {
+        if (spec.start + spec.length > line.length()) {
             throw std::out_of_range("Field " + name + " out of line boundary");
         }
 
         std::string raw = line.substr(spec.start, spec.length);
-        size_t pos = 0;
+        trim(raw); // 需要实现trim函数去除空格
 
         try {
-            if(spec.type == FieldSpec::INT) {
-                int val = std::stoi(raw, &pos);
-                if(name == "TYC1") entry.TYC1 = val;
-                else if(name == "TYC2") entry.TYC2 = val;
-                else if(name == "TYC3") entry.TYC3 = val;
-                else if(name == "e_RAmdeg") entry.e_RAmdeg = val;
-                else if(name == "e_DEpmdeg") entry.e_DEpmdeg = val;
+            if (spec.type == FieldSpec::INT) {
+                int val = raw.empty() ? 0 : std::stoi(raw);
+                if (name == "TYC1") entry.TYC1 = val;
+                else if (name == "TYC2") entry.TYC2 = val;
+                else if (name == "TYC3") entry.TYC3 = (val == 0) ? 1 : val; // 处理空值
+            } else if (spec.type == FieldSpec::DOUBLE) {
+                double val = raw.empty() ? 0.0 : std::stod(raw) * spec.scale;
+                if (name == "mRAdeg") entry.mRAdeg = val;
+                else if (name == "mDEdeg") entry.mDEdeg = val;
+                else if (name == "pmRA") entry.pmRA = val;
+                else if (name == "pmDE") entry.pmDE = val;
+                else if (name == "mepRA") entry.mepRA = val;
+                else if (name == "mepDE") entry.mepDE = val;
+                else if (name == "BT") entry.BT = val;
+                else if (name == "VT") entry.VT = val;
             }
-            else if(spec.type == FieldSpec::DOUBLE) {
-                double val = std::stod(raw) * spec.scale;
-                if(name == "RAmdeg") entry.RAmdeg = val;
-                else if(name == "DEpmdeg") entry.DEpmdeg = val;
-                else if(name == "pmRA") entry.pmRA = val;
-                else if(name == "pmDE") entry.pmDE = val;
-                else if(name == "e_pmRA") entry.e_pmRA = val;
-                else if(name == "e_pmDE") entry.e_pmDE = val;
-            }
-            else if(spec.type == FieldSpec::CHAR) {
-                if(name == "pflag") entry.pflag = raw.empty() ? ' ' : raw[0];
-            }
-        } catch(...) {
+        } catch (...) {
             throw std::runtime_error("Invalid " + name + " value: " + raw);
         }
     }
 
+    // 计算可视星等
+    if (entry.BT > 0 && entry.VT > 0) {
+        double BV = entry.BT - entry.VT;
+        entry.V_mag = entry.VT - 0.090 * BV;
+    } else {
+        entry.V_mag = 99.9; // 无效值标记
+    }
+
+    // 生成标准TYC标识
     entry.TYC_ID = std::to_string(entry.TYC1) + "-"
                  + std::to_string(entry.TYC2) + "-"
                  + std::to_string(entry.TYC3);
@@ -178,19 +308,19 @@ Tycho2Entry Tycho2Dataset::ParseLine(const std::string& line) {
 
 void Tycho2Dataset::FlushRedisBatch(redisContext* c,
                                   std::vector<std::string>& cmds) {
-    for(const auto& cmd : cmds) {
-        if(redisAppendCommand(c, cmd.c_str()) != REDIS_OK) {
-            std::lock_guard <std::mutex> lock(io_mutex_);
+    for (const auto& cmd : cmds) {
+        if (redisAppendCommand(c, cmd.c_str()) != REDIS_OK) {
+            std::lock_guard<std::mutex> lock(io_mutex_);
             std::cerr << "Redis append error: " << c->errstr << std::endl;
             cmds.clear();
             return;
         }
     }
 
-    for(size_t i=0; i<cmds.size(); ++i) {
+    for (size_t i = 0; i < cmds.size(); ++i) {
         redisReply* reply;
-        if(redisGetReply(c, (void**)&reply) != REDIS_OK) {
-            std::lock_guard <std::mutex> lock(io_mutex_);
+        if (redisGetReply(c, (void**)&reply) != REDIS_OK) {
+            std::lock_guard<std::mutex> lock(io_mutex_);
             std::cerr << "Redis error: " << c->errstr << std::endl;
             freeReplyObject(reply);
             break;
@@ -200,3 +330,4 @@ void Tycho2Dataset::FlushRedisBatch(redisContext* c,
 
     cmds.clear();
 }
+

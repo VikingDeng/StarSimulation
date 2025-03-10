@@ -2,6 +2,6 @@ rm -rf build
 mkdir build && cd build
 cmake ..
 make
-cd build
-chmod 777 main
-./main
+cd ..
+chmod 777 ./build/main
+./build/main 2> output.log

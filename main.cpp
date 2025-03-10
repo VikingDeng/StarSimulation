@@ -5,5 +5,5 @@
 
 int main() {
     Tycho2Dataset dataset;
-    dataset.ProcessDirectory("../data/Tycho-2");
+    dataset.ProcessDirectory("data/Tycho-2");
 }

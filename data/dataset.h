@@ -11,19 +11,24 @@
 #include <hiredis/hiredis.h>
 
 struct Tycho2Entry {
+    // 标识符
     int TYC1;
     int TYC2;
     int TYC3;
-    char pflag;
-    double RAmdeg;
-    double DEpmdeg;
-    double pmRA;
-    double pmDE;
-    int e_RAmdeg;
-    int e_DEpmdeg;
-    double e_pmRA;
-    double e_pmDE;
     std::string TYC_ID;
+
+    // 天体测量参数
+    double mRAdeg;    // 平均赤经（度）
+    double mDEdeg;    // 平均赤纬（度）
+    double pmRA;      // 赤经自行（角秒/年）
+    double pmDE;      // 赤纬自行（角秒/年）
+    double mepRA;     // 赤经平均历元（年）
+    double mepDE;     // 赤纬平均历元（年）
+
+    // 星等参数
+    double BT;
+    double VT;
+    double V_mag;     // 计算后的可视星等
 };
 
 class Tycho2Dataset {
