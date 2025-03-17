@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <sys/stat.h>
 #include <atomic>
+#include <cmath>
 
 namespace {
     // 字段定义 (字节位置从0开始计算)
@@ -30,8 +31,8 @@ namespace {
         {"TYC3",    {11,  2, FieldSpec::INT,    1}},     // 修正位置
         {"mRAdeg",  {15, 13, FieldSpec::DOUBLE, 1}},
         {"mDEdeg",  {28, 13, FieldSpec::DOUBLE, 1}},
-        {"pmRA",    {41,  8, FieldSpec::DOUBLE, 0.001}},
-        {"pmDE",    {49,  8, FieldSpec::DOUBLE, 0.001}},
+        {"pmRA",    {41,  8, FieldSpec::DOUBLE, 0.001}}, // 单位：mas/yr
+        {"pmDE",    {49,  8, FieldSpec::DOUBLE, 0.001}}, // 单位：mas/yr
         {"mepRA",   {75,  8, FieldSpec::DOUBLE, 1}},
         {"mepDE",   {83,  8, FieldSpec::DOUBLE, 1}},
         {"BT",      {110, 7, FieldSpec::DOUBLE, 1}},
@@ -56,10 +57,10 @@ namespace {
     }
 
     void trim(std::string& s) {
-        s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch) {
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
             return !std::isspace(ch);
         }));
-        s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) {
+        s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
             return !std::isspace(ch);
         }).base(), s.end());
     }
@@ -145,6 +146,15 @@ namespace {
         freeReplyObject(reply);
         fout << "----------------------------------------" << std::endl;
     }
+
+    // 获取当前年份作为临时观测时间
+    int getCurrentYear() {
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+        std::tm now_tm;
+        localtime_r(&now_c, &now_tm);
+        return now_tm.tm_year + 1900;
+    }
 }
 
 void Tycho2Dataset::ProcessDirectory(const std::string& data_dir) {
@@ -165,13 +175,13 @@ void Tycho2Dataset::ProcessDirectory(const std::string& data_dir) {
         }
 
         // 记录数据库当前状态
-        LogDatabaseStatus(c, "database_status.log");
+        // LogDatabaseStatus(c, "database_status_before_insertion.log");
 
         // 统计总行数
         CountTotalLines(files);
 
         // 启动进度条更新线程
-        std::thread progress_thread([]() {
+        std::thread progress_thread([&]() { // 使用引用捕获
             while (total_lines_processed.load() < total_lines_to_process.load()) {
                 UpdateProgress();
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -180,9 +190,12 @@ void Tycho2Dataset::ProcessDirectory(const std::string& data_dir) {
             std::cout << std::endl;
         });
 
+        // 获取当前年份作为临时观测时间
+        int currentYear = getCurrentYear();
+
         for (const auto& file : files) {
-            workers.emplace_back([this, file] {
-                ProcessFile(file);
+            workers.emplace_back([this, file, currentYear] {
+                ProcessFile(file, currentYear);
             });
         }
 
@@ -191,6 +204,10 @@ void Tycho2Dataset::ProcessDirectory(const std::string& data_dir) {
         }
 
         progress_thread.join();
+
+        // 记录数据库插入后的状态
+        LogDatabaseStatus(c, "database_status_after_insertion.log");
+
         redisFree(c);
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lock(io_mutex_);
@@ -198,7 +215,7 @@ void Tycho2Dataset::ProcessDirectory(const std::string& data_dir) {
     }
 }
 
-void Tycho2Dataset::ProcessFile(const std::string& file_path) {
+void Tycho2Dataset::ProcessFile(const std::string& file_path, int currentYear) {
     redisContext* c = redisConnect(redis_host_.c_str(), redis_port_);
     if (c == nullptr || c->err) {
         std::lock_guard<std::mutex> lock(io_mutex_);
@@ -224,15 +241,27 @@ void Tycho2Dataset::ProcessFile(const std::string& file_path) {
         try {
             Tycho2Entry entry = ParseLine(line);
 
+            // 1. 根据星历把星的赤经赤纬调整到现在的位置
+            double deltaT_ra = currentYear - entry.mepRA;
+            double deltaT_de = currentYear - entry.mepDE;
+
+            // pmRA 和 pmDE 的单位是 milliarcseconds/year，需要转换为 degrees/year
+            double pmRA_deg_per_year = entry.pmRA / 3600000.0;
+            double pmDE_deg_per_year = entry.pmDE / 3600000.0;
+
+            entry.mRAdeg += pmRA_deg_per_year * deltaT_ra;
+            entry.mDEdeg += pmDE_deg_per_year * deltaT_de;
+
+            // 将赤经归一化到 0-360 度
+            while (entry.mRAdeg < 0) entry.mRAdeg += 360.0;
+            while (entry.mRAdeg >= 360.0) entry.mRAdeg -= 360.0;
+
+            // 2. 存到数据库里面的星只需要3个条目：赤经、赤纬、星等
             std::string cmd =
                 "HSET " + entry.TYC_ID +
-                " mRAdeg " + std::to_string(entry.mRAdeg) +
-                " mDEdeg " + std::to_string(entry.mDEdeg) +
-                " pmRA " + std::to_string(entry.pmRA) +
-                " pmDE " + std::to_string(entry.pmDE) +
-                " mepRA " + std::to_string(entry.mepRA) +
-                " mepDE " + std::to_string(entry.mepDE) +
-                " V_mag " + std::to_string(entry.V_mag);
+                " ra " + std::to_string(entry.mRAdeg) +
+                " dec " + std::to_string(entry.mDEdeg) +
+                " magnitude " + std::to_string(entry.V_mag);
 
             redis_cmds.push_back(cmd);
 
@@ -330,4 +359,3 @@ void Tycho2Dataset::FlushRedisBatch(redisContext* c,
 
     cmds.clear();
 }
-
